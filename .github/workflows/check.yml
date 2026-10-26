@@ -1,0 +1,33 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scripts compile
+        run: python -m py_compile analyze_statements.py presidio_redact_statements.py personal_config.example.py
+
+      - name: Analyzer imports with default settings
+        run: |
+          python -m pip install pymupdf openpyxl
+          FEFA_BASE="$RUNNER_TEMP/fefa" python -c "import analyze_statements"
+
+      - name: No statements or personal files are tracked
+        run: |
+          bad=$(git ls-files | grep -Ei '\.(pdf|xlsx|xlsm|xls|csv)$|^personal_config\.py$|^(processed_ledger|last_error)|^[^/]+\.json$|^(Inputs|Redacted)/' || true)
+          if [ -n "$bad" ]; then
+            echo "These files must not be in the repository:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "Clean."

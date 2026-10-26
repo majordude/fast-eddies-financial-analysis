@@ -1,5 +1,7 @@
 # Fast Eddies Financial Spending and Income Analysis
 
+![Check](https://github.com/majordude/fast-eddies-financial-analysis/actions/workflows/check.yml/badge.svg)
+
 Turns bank and credit card statement PDFs into an Excel workbook: income vs expenses, spending by category, transfers,
 charts, and proof that every month ties to the statements. Statements are redacted first; the analyzer reads only the
 redacted copies. Nothing is uploaded anywhere.
