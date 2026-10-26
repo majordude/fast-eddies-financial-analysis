@@ -1,0 +1,14 @@
+# Never commit statements, workbooks, personal rules or any personal data
+*.pdf
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.json
+!examples/*.json
+personal_config.py
+last_error.txt
+__pycache__/
+.venv/
+Inputs/
+Redacted/

@@ -1,0 +1,94 @@
+HOWTO - Fast Eddies Financial Spending and Income Analysis
+
+Do the installation in README_FIRST.txt first. All commands below are typed in PowerShell, in the Analysis folder:
+    cd C:\CCardStatements\Analysis
+
+
+A. EVERY MONTH
+
+  1. Save the new statement PDFs under C:\CCardStatements\Inputs. A subfolder per bank or card is fine.
+  2. Redact. Test on one file first, then run everything:
+         .\run_redact.ps1 -Test
+         .\run_redact.ps1
+     To process only one subfolder:   .\run_redact.ps1 BankName
+     Output goes to C:\CCardStatements\Redacted, with a report in Redacted\redaction_review.json.
+  3. Open one or two files in Redacted and look. Names, addresses and long account numbers should be blacked out,
+     last four digits kept, vendor text and amounts untouched.
+     If a message says LEAK CHECK FAILED, that file was deleted on purpose; do not use that output.
+  4. Analyze:
+         .\run_analyze.ps1
+  5. Open Analysis\Income_vs_Expense_<year>_<first month>-<last month>.xlsx. Start with the Review tab.
+     A values-only advisor summary is saved next to it (<AdvisorName>_Summary_<year>_...xlsx).
+
+  Files are remembered by content, so re-running never counts a statement twice. A changed spend list replaces its
+  earlier version. To start over, delete Analysis\processed_ledger.json.
+  If Excel has the workbook open, the analyzer saves a copy with a time stamp instead; close Excel and run again.
+
+
+B. WHAT THE ANALYZER READS
+
+  Citi credit card PDFs         file name contains "redacted"
+  Apple Card PDFs               recognised by content
+  Credit-union / bank PDFs      recognised by content (statement summary and member number)
+  Excel or CSV spend lists      any .xlsx or .csv with date, payee and amount columns; total rows are used as a check
+
+  Put redacted PDFs and spend lists anywhere under Redacted (subfolders are scanned).
+
+
+C. PERSONAL RULES (personal_config.py)
+
+  Everything specific to you lives in personal_config.py, next to analyze_statements.py. Git ignores it, so it never
+  reaches GitHub. Copy personal_config.example.py to personal_config.py and edit. What it can hold:
+    names shown on the tabs, income sources (pensions, Social Security split), brokerage / 529 / mortgage text,
+    payees on the bank statement, vendors on card statements, fraud vendors to flag, spend-list names.
+  After changing any rule in personal_config.py, delete Analysis\processed_ledger.json and run the analyzer again.
+
+  Three small JSON files in the Analysis folder need no ledger reset (edit, run again). Examples are in examples\.
+    check_payees.json        names for check numbers:   {"1001": ["Payee name", "Category"]}
+    vendor_overrides.json    a card charge booked under the wrong merchant:
+                             {"BILLED NAME REGEX": ["What it really was", "Category"]}
+                             Remove an entry to restore the original.
+    brokerage_yearend.json   the brokerage's own year-end withdrawal figures, for the cross-check tab:
+                             {"2025": [["Transfer withdrawals", 10000]]}
+                             The check runs only for years listed.
+
+  To move to another PC, copy personal_config.py and these JSON files by hand (USB, OneDrive). Do not put them in
+  GitHub.
+
+
+D. ADDING A NEW CARD
+
+  Citi and Apple Card statements are read automatically. For another issuer:
+    1. Redact the PDFs and put them in Redacted. Run the analyzer once.
+    2. Payments to that card from the bank show up as expenses named "Credit card payments - other cards" and are
+       listed on the Review tab. They are counted once, when paid, so nothing is lost while the card is missing.
+    3. A new issuer needs its own statement reader (see parse_apple_statement and build_apple_rows in
+       analyze_statements.py for a worked example) and one line added to CARD_LINKS. After that, each bank payment
+       to the card that the card's own statement also shows becomes a transfer, and the card's purchases are counted
+       from its statements. Nothing is counted twice.
+    4. A payment with no matching card-statement payment stays an expense and is listed on the Review tab.
+
+
+E. CHANGING CATEGORIES
+
+  Put your own vendor rules in personal_config.py (CATEGORY_RULES_FIRST for cards, BANK_RULES_FIRST for the bank).
+  Filter Bank Transactions or Transactions on Category = Uncategorized to find vendors that need a rule.
+  After editing rules, delete Analysis\processed_ledger.json and run the analyzer again.
+
+
+F. COPYING THE TOOL TO ANOTHER PC
+
+  1. Follow README_FIRST.txt section 2 on the new PC (installs everything).
+  2. Copy personal_config.py and your JSON files into C:\CCardStatements\Analysis by hand.
+  3. Copy the whole Analysis\processed_ledger.json too if you want the new PC to remember what is already processed.
+     Without it, copy the redacted PDFs over instead and the analyzer rebuilds everything from them.
+
+
+G. TROUBLESHOOTING
+
+  "Already processed, skipped" for a file you changed     Delete the ledger, or save the file under a new name.
+  A statement says "does not tie"                         Open Reconciliation or Bank Reconciliation; the status
+                                                          column says which figure differs.
+  "Could not read the statement period"                   The PDF is not a supported layout, or it is empty.
+  Uncategorized rows                                      Add a rule (section E), delete the ledger, run again.
+  Any error                                               Printed on screen and saved to Analysis\last_error.txt.

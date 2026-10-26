@@ -1,0 +1,61 @@
+HOW IT WORKS - Fast Eddies Financial Spending and Income Analysis
+
+PRIVACY
+  The redactor (presidio_redact_statements.py) reads the original PDFs in Inputs and writes redacted copies to
+  Redacted. It removes names, SSNs, bank and account numbers, addresses and e-mail addresses on header, summary and
+  address lines, and keeps the last four digits of card and account numbers. Transaction rows (lines that start with a
+  date) are left alone so vendors and amounts stay readable. After saving each file the redactor reopens it and checks
+  that no e-mail address or holder name remains; if one does, it deletes the file and prints LEAK CHECK FAILED.
+  It is automatic, so spot check a file or two. It can blank part of a merchant name; the analyzer labels those
+  "MERCHANT NAME NOT LEGIBLE" and the Review tab counts them.
+  The analyzer (analyze_statements.py) reads only the redacted copies.
+
+HOW THE NUMBERS ARE CHECKED
+  Credit cards: each statement is compared with its own account summary (previous balance, payments, credits,
+  purchases, fees, interest, new balance).
+  Bank: for every account and month, opening balance plus all rows equals the closing balance, the running balance
+  holds row by row, and deposits and withdrawals match the statement's summary table.
+  Transfers tab: opening balance + income - expenses + net transfers equals the statement closing balance, every
+  month. The difference row must be zero.
+  Anything that does not tie is highlighted and listed on the Review tab. Nothing is silently dropped; an unreadable
+  gap becomes its own line labelled "UNRECONCILED - REVIEW".
+
+DECISIONS BUILT IN
+  A statement counts in the month it closes (cash month = statement month).
+  Card payments from the bank are transfers once the card's own statement shows the same payment (same amount,
+  within a few days). Card spend comes from the card statements, so nothing is counted twice. A bank payment to a
+  card with no matching statement payment stays an expense and is listed on the Review tab.
+  Payments to cards whose statements are not loaded yet are an expense line ("Credit card payments - other cards"),
+  flagged until those statements are added.
+  Card interest and fees charged on the card statements are an expense line ("Card interest & fees"); they are paid
+  through the card payments, which are transfers.
+  Apple Card: all charges, returns and dispute credits are tied to the statement's own totals and balances. Daily
+  Cash is paid into Apple Cash, not the card balance, so it is a memo (Apple Card tab, Reconciliation, Transactions
+  column R) and is never netted from spend. A return also takes back the Daily Cash earned on it; that amount is part
+  of the statement's charges and is folded into the return line.
+  Brokerage transfers into the bank count as income under their own label, with a separate row showing net cash flow
+  before them. Money sent back to the brokerage is a transfer.
+  Transfers between the bank's own accounts must net to zero.
+  Checks show only a number on the statement, so they appear as "Checks written (payee not on statement)" unless
+  listed in check_payees.json.
+  A manual spend list marked as a reference account is a cross-check only; the bank statements are the source.
+  Each calendar year gets its own workbook. A year with statements only through, say, September is named
+  Income_vs_Expense_2026_Jan-Sep.xlsx and titled "year to date through Sep".
+
+WORKBOOK TABS
+  Advisor Summary, Advisor Categories   income, transfers and spending by month for the year, spending grouped;
+                                        also saved on its own (values only, no transactions)
+  Cash Flow                             income by source and expenses by category, by month, with net cash flow
+  Income vs Expense Charts              income by source, income vs expenses, expense categories, brokerage in/out
+  Transfers                             money moved, brokerage cross-check, balance tie-out
+  Grand Totals, Charts, one tab per card    card spend, Pareto drivers, payments, interest, fraud and breach flags
+  Transactions, Bank Transactions       every row, filterable, with category, source file and original description
+  Reconciliation, Bank Reconciliation   proof for every statement
+  Processed Files, Review               what was read, and everything that needs a human look
+
+ADDING ANOTHER BANK OR CARD ISSUER
+  The bank parser reads one credit-union layout by position: section headers, the date, description, amount and
+  balance columns, and the summary table. A different bank layout needs its own parser that returns the same
+  structure (accounts, rows, opening and closing balances, summary figures); classification, charts and
+  reconciliation then work unchanged. A new card issuer needs its own statement reader (see parse_apple_statement
+  and build_apple_rows) and an entry in CARD_LINKS.
