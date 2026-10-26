@@ -12,8 +12,7 @@ which git ignores (see personal_config.example.py).
 
 ## License
 
-GNU General Public License v3.0 (see LICENSE). Copyright (C) 2026 majordude. You may use and change this software, but
-a version you distribute must stay open source under the same license.
+MIT License (see LICENSE). Copyright (c) 2026 majordude.
 
 ## Disclaimer
 
