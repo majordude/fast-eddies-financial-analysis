@@ -65,6 +65,15 @@ PERIOD_HEADER = re.compile(
 HOLDER_LABEL = re.compile(r"^\s*(Apple Card Customer|Cardholder|Card Holder|Account Holder|Primary Account Holder)\s*:?\s*$",
                           re.IGNORECASE)
 
+# Mailing-address lines (street line, then a city / state / ZIP line) are removed on every non-transaction line.
+# Rows that start with a date (merchant locations) are never touched.
+STREET_LINE = re.compile(
+    r"^\s*\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9 .'-]+?\s+"
+    r"(?:ST|STREET|RD|ROAD|AVE|AVENUE|LN|LANE|DR|DRIVE|CT|COURT|BLVD|BOULEVARD|WAY|PL|PLACE|CIR|CIRCLE|"
+    r"TER|TERRACE|PKWY|PARKWAY|HWY|HIGHWAY|TRL|TRAIL|RUN|PIKE)\b\.?(?:\s+(?:APT|UNIT|STE|SUITE|#)\s*[\w-]+)?\s*$",
+    re.IGNORECASE)
+CITY_LINE = re.compile(r"^\s*[A-Za-z][A-Za-z .'-]{2,40}(?:,?\s+[A-Z]{2})?(?:\s+\d{5}(?:-\d{4})?)?\s*$")
+
 # Text immediately before a span that means it is a masked card / "ending in" number.
 MASK_BEFORE = re.compile(
     r"(?:[xX*\u2022\u25cf]{2,}[\s-]*|ending(?:\s+in)?\s*|last\s*(?:4|four)\s*(?:digits)?[:\s]*)$",
@@ -167,6 +176,33 @@ def transaction_row_flags(lines):
     return flags
 
 
+MONEY_IN = re.compile(r"\d[\d,]*\.\d{2}\b")
+
+
+def row_extent(lines):
+    """(top, bottom) of the transaction rows on a page, or None. A transaction row is a date-led line whose band also
+    holds an amount, so a page header that merely starts with a date does not count. Text inside the extent is table
+    text (merchant continuation lines) that the address rule must never touch."""
+    ys = []
+    for text, rects in lines:
+        if not (ROW_DATE.match(text) and not PERIOD_HEADER.match(text)):
+            continue
+        y0, y1 = min(r.y0 for r in rects), max(r.y1 for r in rects)
+        for t2, r2 in lines:
+            mid = (min(r.y0 for r in r2) + max(r.y1 for r in r2)) / 2
+            if y0 - 1 <= mid <= y1 + 1 and MONEY_IN.search(t2):
+                ys.append((y0, y1))
+                break
+    return (min(a for a, _ in ys), max(b for _, b in ys)) if ys else None
+
+
+def in_table(rects, ext):
+    if not ext:
+        return False
+    mid = (min(r.y0 for r in rects) + max(r.y1 for r in rects)) / 2
+    return ext[0] - 1 <= mid <= ext[1] + 1
+
+
 def span_rect(text, rects, start, end, keep_last=0):
     """
     Union rect covering text[start:end]. With keep_last, the final keep_last
@@ -234,6 +270,7 @@ def main():
         pre_text = "\n".join(p.get_text() for p in doc)
         last4_votes = Counter(find_last4_candidates(pre_text))
         file_info = {"input": str(pdf_path), "output": None, "pages": []}
+        page_ext = {}
 
         for page_no, page in enumerate(doc, start=1):
             lines = get_lines(page)
@@ -245,8 +282,24 @@ def main():
             skipped_rows = 0
 
             prev_was_holder_label = False
+            prev_was_street = False
+            ext = row_extent(lines)
+            page_ext[page_no] = ext
             for (text, rects), is_row in zip(lines, row_flags):
                 was_label, prev_was_holder_label = prev_was_holder_label, bool(HOLDER_LABEL.match(text))
+                if text.strip() and not is_row and not in_table(rects, ext):
+                    was_street = prev_was_street
+                    prev_was_street = bool(STREET_LINE.match(text))
+                    if prev_was_street or (was_street and CITY_LINE.match(text) and "$" not in text):
+                        rect = span_rect(text, rects, 0, len(text))
+                        if rect is not None:
+                            h = rect.y1 - rect.y0     # cover the middle of the line only, so touching neighbours survive
+                            rect.y0, rect.y1 = rect.y0 + 0.25 * h, rect.y1 - 0.25 * h
+                            add_redaction(redactions, rect, "MAILING ADDRESS line")
+                            page_hits.append({"type": "ADDRESS_LINE", "value": "[redacted]"})
+                        continue
+                elif text.strip():
+                    prev_was_street = False
                 if text.strip():
                     for em in EMAIL_RE.finditer(text):
                         rect = span_rect(text, rects, em.start(), em.end())
@@ -380,17 +433,30 @@ def main():
         if month == "UnknownMonth" or last4 == "UNK":
             print(f"CHECK NAME for {pdf_path.name}: month={month}, last4={last4}")
 
-        doc.save(out_path, garbage=4, deflate=True, clean=True)
+        tmp_path = OUTPUT_DIR / f"~{out_path.stem}.tmp"   # not a .pdf, so the analyzer never sees a half-checked file
+        doc.save(tmp_path, garbage=4, deflate=True, clean=True)
         doc.close()
-        out_text = "\n".join(pg.get_text() for pg in fitz.open(out_path))
-        leaks = sorted({e for e in EMAIL_RE.findall(out_text)} | {t for t in holder_text if t in out_text})
-        if leaks:
-            out_path.unlink()
-            print(f"LEAK CHECK FAILED for {pdf_path.name}: {len(leaks)} identifying item(s) are still readable, so the "
-                  f"output was deleted. Do not use this file; tell Claude.")
-            file_info["leak_check"] = "FAILED, output deleted"
+        out_doc = fitz.open(str(tmp_path), filetype="pdf")
+        out_text = "\n".join(pg.get_text() for pg in out_doc)
+        reasons = []
+        if EMAIL_RE.search(out_text):
+            reasons.append("an e-mail address is still readable")
+        if any(t in out_text for t in holder_text):
+            reasons.append("the account-holder name is still readable")
+        for pno, pg in enumerate(out_doc, start=1):   # a street-address line outside the transaction table must be gone
+            pg_lines = get_lines(pg)
+            for (ltext, lr), lrow in zip(pg_lines, transaction_row_flags(pg_lines)):
+                if not lrow and not in_table(lr, page_ext.get(pno)) and STREET_LINE.match(ltext):
+                    reasons.append(f"a street-address line is still readable (page {pno})")
+        out_doc.close()
+        if reasons:
+            tmp_path.unlink()
+            print(f"LEAK CHECK FAILED for {pdf_path.name}: {'; '.join(sorted(set(reasons)))}. No output was written and "
+                  f"any earlier copy was left alone. Do not use this file; tell Claude.")
+            file_info["leak_check"] = "FAILED, no output written: " + "; ".join(sorted(set(reasons)))
             report["files"].append(file_info)
             continue
+        os.replace(tmp_path, out_path)
         file_info["leak_check"] = "passed"
         report["files"].append(file_info)
         print(f"Created: {out_path.name}  (from {pdf_path.name})")

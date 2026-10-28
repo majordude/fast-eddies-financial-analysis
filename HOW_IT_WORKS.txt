@@ -33,6 +33,11 @@ DECISIONS BUILT IN
   Cash is paid into Apple Cash, not the card balance, so it is a memo (Apple Card tab, Reconciliation, Transactions
   column R) and is never netted from spend. A return also takes back the Daily Cash earned on it; that amount is part
   of the statement's charges and is folded into the return line.
+  Synchrony store cards (Amazon Prime Store Card): the page-1 summary and the Account Balance Summary table are both
+  read and must agree; purchases, credits, payments, fees and interest are tied to those totals and to previous
+  balance - payments & credits + purchases + interest = new balance. Every purchase keeps its item name (Store Card
+  Items tab). A payment on a statement pays the previous statement, so a bank payment becomes a transfer only when that
+  previous statement is loaded; otherwise it stays an expense and nothing is lost or counted twice.
   Brokerage transfers into the bank count as income under their own label, with a separate row showing net cash flow
   before them. Money sent back to the brokerage is a transfer.
   Transfers between the bank's own accounts must net to zero.
@@ -58,4 +63,4 @@ ADDING ANOTHER BANK OR CARD ISSUER
   balance columns, and the summary table. A different bank layout needs its own parser that returns the same
   structure (accounts, rows, opening and closing balances, summary figures); classification, charts and
   reconciliation then work unchanged. A new card issuer needs its own statement reader (see parse_apple_statement
-  and build_apple_rows) and an entry in CARD_LINKS.
+  and build_apple_rows, or parse_synchrony_statement for a card with item names) and an entry in CARD_LINKS.

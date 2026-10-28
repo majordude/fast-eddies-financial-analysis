@@ -92,7 +92,8 @@ What it does
 
 5. WHAT IS SUPPORTED
 
-  Credit card statements: Citi (Costco Anywhere Visa, Premier layouts) and Apple Card.
+  Credit card statements: Citi (Costco Anywhere Visa, Premier layouts), Apple Card, and Synchrony store cards
+  (Amazon Prime Store Card layout; each purchase line keeps its item name, shown on the Store Card Items tab).
   Bank statements: the credit-union layout this was built on (statement summary with member number, sub-accounts,
   date / description / amount / balance columns).
   Spend lists: any .xlsx or .csv with date, payee and amount columns.

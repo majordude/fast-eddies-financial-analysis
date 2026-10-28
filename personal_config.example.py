@@ -60,5 +60,9 @@ BREACH_VENDORS = [(r"EXAMPLE SHADY SITE", "Unauthorized charges disputed 2025-04
 # ---- file and card names ---------------------------------------------------------------------------------------
 ACCOUNT_BY_FILE = [(r"medical", "Medical list")]    # spend-list file name pattern -> account name
 REFERENCE_ACCOUNTS = {"Medical list"}               # lists that are a cross-check only, not counted
+# A statement that closes in one month but should count in another. Key = card tab name | closing date.
+STATEMENT_MONTH_OVERRIDES = {}                      # {"Amazon Store Card 1234|2026-01-09": "2025-12"}
+# Your own keyword rules for store-card item names (tried before the built-in ones): (regex on the item name, category).
+ITEM_RULES_FIRST = []                               # [(r"GUITAR|AMP\b", "Recreation & Entertainment")]
 CARD_ALIASES = {}                                   # {"Old card name": "New card name"} when a card is re-numbered
 LOCATION_WORDS_EXTRA = "EXAMPLETOWN EXAMPLEVILLE"   # town names that appear on statements (not vendor names)

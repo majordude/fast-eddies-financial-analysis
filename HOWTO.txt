@@ -29,6 +29,7 @@ B. WHAT THE ANALYZER READS
 
   Citi credit card PDFs         file name contains "redacted"
   Apple Card PDFs               recognised by content
+  Synchrony store card PDFs     recognised by content (Amazon Prime Store Card layout)
   Credit-union / bank PDFs      recognised by content (statement summary and member number)
   Excel or CSV spend lists      any .xlsx or .csv with date, payee and amount columns; total rows are used as a check
 
@@ -58,7 +59,7 @@ C. PERSONAL RULES (personal_config.py)
 
 D. ADDING A NEW CARD
 
-  Citi and Apple Card statements are read automatically. For another issuer:
+  Citi, Apple Card and Synchrony store card statements are read automatically. For another issuer:
     1. Redact the PDFs and put them in Redacted. Run the analyzer once.
     2. Payments to that card from the bank show up as expenses named "Credit card payments - other cards" and are
        listed on the Review tab. They are counted once, when paid, so nothing is lost while the card is missing.
@@ -67,6 +68,13 @@ D. ADDING A NEW CARD
        to the card that the card's own statement also shows becomes a transfer, and the card's purchases are counted
        from its statements. Nothing is counted twice.
     4. A payment with no matching card-statement payment stays an expense and is listed on the Review tab.
+    5. Store cards (Synchrony): a payment printed on a statement pays the PREVIOUS statement, so the bank payment
+       becomes a transfer only when that previous statement is loaded too. Otherwise it stays an expense, so the
+       spend is counted exactly once either way. Load more months and earlier payments clear themselves.
+    6. A statement that closes in one month but should count in another (for example a cycle running 12/10 to 01/09
+       that you want in December) is set in personal_config.py: STATEMENT_MONTH_OVERRIDES.
+    7. The Store Card Items tab sorts purchases by keywords in the printed item name. Add your own keyword rules as
+       ITEM_RULES_FIRST in personal_config.py (same format as the built-in ITEM_RULES).
 
 
 E. CHANGING CATEGORIES

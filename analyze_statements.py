@@ -5,7 +5,7 @@ Reads redacted statements (PDF) and optional spend lists (Excel/CSV) and builds 
 (income vs expenses by month, spend by category and card, reconciliation, review list) plus an
 advisor-ready two-tab summary.
 
-Input : PDFs with 'redacted' in the name (credit card statements - Citi and Apple Card layouts - and credit-union
+Input : PDFs with 'redacted' in the name (credit card statements - Citi, Apple Card and Synchrony store card layouts - and credit-union
         statements, detected by content), and any .xlsx/.csv spend list, anywhere under <BASE>\\Redacted
         (subfolders are included). A spend list needs columns for date, payee/provider, amount and
         (optionally) category; total rows are used to check it. A changed spend list replaces its earlier version.
@@ -96,6 +96,10 @@ BREACH_VENDORS = list(_pc("BREACH_VENDORS", []))
 
 # Merge cards whose account number changed. Format: {"Citi Premier 1111": "Citi Premier 2222"}
 CARD_ALIASES = dict(_pc("CARD_ALIASES", {}))
+
+# A statement that closes in one month but should count in another (for example a store-card cycle that runs
+# 12/10 to 01/09 and is wanted in December). Format: {"Amazon Store Card 1234|2026-01-09": "2025-12"}
+STATEMENT_MONTH_OVERRIDES = dict(_pc("STATEMENT_MONTH_OVERRIDES", {}))
 
 # Account name for Excel/CSV spend lists, chosen by a pattern in the file name.
 # Anything not matched is named after the file. Format: [(regex on file name, account name)]
@@ -778,6 +782,345 @@ def process_apple_pdf(ledger, pdf, h):
     return True
 
 
+# ----------------------------------------------------------------------------
+# Synchrony store cards (Amazon Prime Store Card and other Synchrony layouts): one PDF per billing cycle.
+# Every purchase line carries the item name, which feeds the Store Card Items tab (what was bought).
+# A card payment becomes a transfer only when the statement it pays is loaded (see link_card_payments).
+# ----------------------------------------------------------------------------
+SYN_CYCLE = re.compile(r"(\d+) Day Billing Cycle from (\d\d/\d\d/\d{4}) to (\d\d/\d\d/\d{4})")
+SYN_MONEY = re.compile(r"^([+-])?\s*\$?\s*([\d,]*\d\.\d\d)$")
+SYN_REF = re.compile(r"^(?=.*\d)[A-Z0-9]{8,}$")
+SYN_TOKEN = re.compile(r"^[A-Za-z0-9]{12}$")
+SYN_NOISE = re.compile(r"^(\(Continued on next page\)|PAGE \d+ of \d+|Visit us at .*|Transaction Detail \(Continued\)|"
+                       r"Date|Reference #|Description|Amount|Account Number ending in \d{4})$")
+SYN_SECTIONS = {"Payments": "pay", "Other Credits": "credit", "Purchases and Other Debits": "purch",
+                "Fees Charged": "fees", "Fees": "fees", "Interest Charged": "interest"}
+
+
+def _syn_money(tok):
+    m = SYN_MONEY.match(tok.strip().replace("−", "-"))
+    if not m:
+        return None
+    v = float(m.group(2).replace(",", ""))
+    return -v if m.group(1) == "-" else v
+
+
+def is_synchrony_pdf(path):
+    try:
+        doc = fitz.open(path)
+        text = "\n".join(doc[i].get_text() for i in range(min(len(doc), 3)))
+        doc.close()
+    except Exception:
+        return False
+    return bool(re.search(r"\.syf\.com", text, re.I)) and "Account Number ending in" in text
+
+
+def parse_synchrony_statement(path):
+    lines = read_lines(path)
+    text = "\n".join(lines)
+    res = {"rows": [], "summary": {}, "table": None, "detail_fees": None, "detail_interest": None,
+           "start": None, "end": None, "last4": "UNK", "brand": ""}
+    m = re.search(r"Account Number ending in (\d{4})", text)
+    if m:
+        res["last4"] = m.group(1)
+    m = re.search(r"https?://(?:www\.)?([\w-]+)\.syf\.com", text, re.I)
+    if m:
+        res["brand"] = m.group(1).lower()
+    m = SYN_CYCLE.search(text)
+    if m:
+        res["start"] = datetime.strptime(m.group(2), "%m/%d/%Y").date()
+        res["end"] = datetime.strptime(m.group(3), "%m/%d/%Y").date()
+    # page-1 Account Summary: label line, then the value on the next line
+    try:
+        a0 = lines.index("Account Summary")
+    except ValueError:
+        a0 = None
+    if a0 is not None:
+        for i in range(a0 + 1, min(a0 + 40, len(lines) - 1)):
+            ln = lines[i]
+            if SYN_CYCLE.search(ln):
+                break
+            v = _syn_money(lines[i + 1])
+            if v is None:
+                continue
+            if ln.startswith("Previous Balance as of"):
+                res["summary"]["prev"] = v
+            elif ln.startswith("New Balance as of"):
+                res["summary"]["new"] = v
+            elif ln == "Payments":
+                res["summary"]["payments"] = v
+            elif ln == "Other Credits":
+                res["summary"]["credits"] = v
+            elif ln.startswith("Purchases"):
+                res["summary"]["purchases"] = v
+            elif "Fee" in ln:
+                res["summary"]["fees"] = v
+            elif "Interest" in ln:
+                res["summary"]["interest"] = v
+    # Account Balance Summary table: Total row = previous, payments & credits, purchases+fees, interest, expired, new
+    try:
+        b0 = lines.index("Account Balance Summary")
+        t0 = next(i for i in range(b0, len(lines)) if lines[i] == "Total")
+        vals = []
+        for ln in lines[t0 + 1:t0 + 7]:
+            vals.append(0.0 if ln in ("-", "–") else _syn_money(ln))
+        if len(vals) == 6 and None not in vals:
+            res["table"] = vals
+    except (ValueError, StopIteration):
+        pass
+    # Transaction Detail
+    try:
+        d0 = lines.index("Transaction Detail")
+    except ValueError:
+        return res
+    rows, sec, i, n = [], None, d0 + 1, len(lines)
+    after_totals = False
+    while i < n:
+        ln = lines[i]
+        if re.search(r"Year-to-Date Fees and Interest|Interest Charge Calculation", ln):
+            break
+        if SYN_NOISE.match(ln):
+            i += 1
+            continue
+        if ln.startswith("Total Fees Charged This Period") and i + 1 < n:
+            res["detail_fees"] = _syn_money(lines[i + 1])
+            after_totals = True
+            i += 2
+            continue
+        if ln.startswith("Total Interest Charged This Period") and i + 1 < n:
+            res["detail_interest"] = _syn_money(lines[i + 1])
+            after_totals = True
+            i += 2
+            continue
+        if ln in SYN_SECTIONS and i + 1 < n and _syn_money(lines[i + 1]) is not None:
+            sec = SYN_SECTIONS[ln]
+            i += 2
+            continue
+        if DATE_RE.match(ln) and (sec or after_totals):
+            row = {"kind": "zone" if after_totals else sec, "d": ln, "ref": "", "desc": "", "amt": None, "item": ""}
+            i += 1
+            if i < n and SYN_REF.match(lines[i]) and _syn_money(lines[i]) is None:
+                row["ref"] = lines[i]
+                i += 1
+            if i < n and _syn_money(lines[i]) is None and not DATE_RE.match(lines[i]):
+                row["desc"] = lines[i]
+                i += 1
+            if i < n and _syn_money(lines[i]) is not None:
+                row["amt"] = _syn_money(lines[i])
+                i += 1
+            parts, first = [], True
+            while i < n:
+                nx = lines[i]
+                if SYN_NOISE.match(nx):
+                    i += 1
+                    continue
+                if (DATE_RE.match(nx) or nx.startswith("Total Fees Charged") or nx.startswith("Total Interest Charged")
+                        or re.search(r"Year-to-Date Fees and Interest|Interest Charge Calculation", nx)
+                        or (nx in SYN_SECTIONS and i + 1 < n and _syn_money(lines[i + 1]) is not None)):
+                    break
+                if first and SYN_TOKEN.match(nx) and not re.search(r"\s", nx):
+                    first = False
+                    i += 1
+                    continue
+                first = False
+                parts.append(nx)
+                i += 1
+            row["item"] = re.sub(r"\s+", " ", " ".join(parts)).strip()
+            rows.append(row)
+            continue
+        i += 1
+    res["rows"] = rows
+    return res
+
+
+def synchrony_card_name(p):
+    brand = p.get("brand") or ""
+    name = "Amazon Store Card" if brand == "amazon" else (f"{brand.title()} Store Card" if brand else "Synchrony Card")
+    return f"{name} {p['last4']}"
+
+
+def item_category(item, channel, base_category):
+    """Category for a store-card purchase from the item name printed on the statement (keyword rules)."""
+    if base_category not in ("Online Shopping", "Uncategorized", "General Retail"):
+        return base_category
+    up = (item or "").upper()
+    if up:
+        for pat, cat in ITEM_RULES:
+            if re.search(pat, up):
+                return cat
+    if "DIGITAL" in (channel or "").upper():
+        return "Subscriptions & Media"
+    return base_category
+
+
+def build_synchrony_rows(p):
+    """Typed transactions for one Synchrony statement, reconciled to the statement's own totals."""
+    end, tb = p["end"], p["table"]
+    out, incomplete = [], 0
+    for r in p["rows"]:
+        if r["amt"] is None:
+            incomplete += 1
+            continue
+        d = infer_date(r["d"], end)
+        amt, kind, desc = r["amt"], r["kind"], r["desc"]
+        channel = re.sub(r"\s+SEATTLE(\s+WA)?\s*$", "", desc).strip()
+        item = r["item"]
+        base = {"date": d, "post": None, "cash": False, "dcash": 0.0, "name": "", "item": "", "channel": ""}
+        if kind == "pay":
+            out.append({**base, "type": PAYMENT, "desc": desc, "amount": round(-amt, 2), "sec": "pay"})
+        elif kind in ("credit", "purch"):
+            if kind == "credit":
+                typ, amount = (REFUND, abs(amt)) if amt <= 0 else (PURCHASE, amt)
+            else:
+                typ, amount = (PURCHASE, amt) if amt >= 0 else (REFUND, -amt)
+            out.append({**base, "type": typ, "desc": channel + (f" | {item}" if item else ""),
+                        "amount": round(amount, 2), "sec": "credit" if kind == "credit" else "purch",
+                        "name": channel, "item": item, "channel": channel})
+        else:   # fees / interest section or the rows printed after the period totals
+            up = desc.upper()
+            if kind == "interest" or up.startswith("INTEREST CHARGE"):
+                if abs(amt) > 0.004:
+                    out.append({**base, "type": INTEREST, "desc": desc, "amount": round(amt, 2), "sec": "interest"})
+            elif kind == "fees" or "FEE" in up:
+                if abs(amt) > 0.004:
+                    out.append({**base, "type": FEE, "desc": desc, "amount": round(amt, 2), "sec": "fees"})
+            elif abs(amt) > 0.004:
+                incomplete += 1
+    s_fees = p["detail_fees"] if p["detail_fees"] is not None else 0.0
+    s_int = p["detail_interest"] if p["detail_interest"] is not None else (tb[3] if tb else 0.0)
+    sm = p["summary"]
+    # Purchases on the statement = the table's "Purchases, Fees & Other Debits" less the fees printed separately
+    s_pur = round(tb[2] - s_fees, 2) if tb else sm.get("purchases")
+    pur_rows = round(sum((t["amount"] if t["type"] == PURCHASE else -t["amount"])
+                         for t in out if t["sec"] == "purch"), 2)
+    pur_diff = round((s_pur if s_pur is not None else pur_rows) - pur_rows, 2)
+    if abs(pur_diff) > 0.005:
+        out.append({"date": end, "post": None, "type": PURCHASE if pur_diff > 0 else REFUND, "desc":
+                    "Amount on statement that could not be itemized", "amount": abs(pur_diff), "cash": False,
+                    "sec": "unrecon", "dcash": 0.0, "name": "", "item": "", "channel": ""})
+    for typ, tot_stmt, label in ((FEE, s_fees, "Fees charged (statement total)"),
+                                 (INTEREST, s_int, "Interest charged (statement total)")):
+        got = round(sum(t["amount"] for t in out if t["type"] == typ), 2)
+        diff = round(tot_stmt - got, 2)
+        if abs(diff) > 0.005:
+            out.append({"date": end, "post": None, "type": typ, "desc": label, "amount": diff, "cash": False,
+                        "sec": "adj", "dcash": 0.0, "name": "", "item": "", "channel": ""})
+    pay_rows = round(sum(t["amount"] for t in out if t["type"] == PAYMENT), 2)
+    cred_rows = round(sum(t["amount"] for t in out if t["type"] == REFUND and t["sec"] == "credit"), 2)
+    paycred_rows = round(pay_rows + cred_rows, 2)
+    s_paycred = tb[1] if tb else (round(-(sm.get("payments", 0) + sm.get("credits", 0)), 2) if "payments" in sm else None)
+    ident = None
+    if tb:
+        ident = round(tb[0] - tb[1] + tb[2] + tb[3] + tb[4] - tb[5], 2)
+    problems = []
+    if not tb:
+        problems.append("Account Balance Summary not read")
+    if incomplete:
+        problems.append(f"{incomplete} row(s) not read")
+    if abs(pur_diff) > 0.005:
+        problems.append(f"purchases off by {pur_diff:,.2f}")
+    if s_paycred is not None and abs(paycred_rows - s_paycred) > 0.005:
+        problems.append(f"payments/credits off by {round(paycred_rows - s_paycred, 2):,.2f}")
+    if ident is not None and abs(ident) > 0.005:
+        problems.append(f"balance check off by {ident:,.2f}")
+    if tb and abs(tb[4]) > 0.005:
+        problems.append(f"promotional balance adjustment {tb[4]:,.2f} not itemized")
+    if tb and sm:   # two independent reads of the same figures (page-1 summary vs the balance table)
+        for key, want, label in (("prev", tb[0], "previous balance"), ("new", tb[5], "new balance")):
+            if key in sm and abs(sm[key] - want) > 0.005:
+                problems.append(f"{label} differs between the summary and the balance table")
+        if "payments" in sm and "credits" in sm and abs(-(sm["payments"] + sm["credits"]) - tb[1]) > 0.005:
+            problems.append("payments/credits differ between the summary and the balance table")
+        if "purchases" in sm and abs(sm["purchases"] - tb[2]) > 0.005:
+            problems.append("purchases differ between the summary and the balance table")
+    recon = {
+        "prev": tb[0] if tb else sm.get("prev"), "new": tb[5] if tb else sm.get("new"),
+        "s_purchases": s_pur, "p_purchases": pur_rows,
+        "s_paycred": s_paycred, "p_paycred": paycred_rows,
+        "s_fees": s_fees, "p_fees": round(sum(t["amount"] for t in out if t["type"] == FEE), 2),
+        "s_interest": s_int, "p_interest": round(sum(t["amount"] for t in out if t["type"] == INTEREST), 2),
+        "cash": None, "balance_check": ident,
+        "status": "OK" if not problems else "CHECK: " + "; ".join(problems),
+    }
+    return out, recon
+
+
+def process_synchrony_pdf(ledger, pdf, h):
+    """Read one Synchrony statement. Returns True when it was recorded."""
+    try:
+        parsed = parse_synchrony_statement(pdf)
+    except Exception as exc:
+        print(f"ERROR reading {pdf.name}: {exc}. Skipped, not recorded; fix or remove the file.")
+        return False
+    if not parsed["end"]:
+        print(f"Could not read the billing cycle, NOT recorded (will retry next run): {pdf.name}")
+        return False
+    card_tab = CARD_ALIASES.get(synchrony_card_name(parsed), synchrony_card_name(parsed))
+    stmt_key = f"{card_tab}|{parsed['end'].isoformat()}"
+    entry = {"name": pdf.name, "card": card_tab, "period_end": parsed["end"].strftime("%m/%d/%Y"),
+             "rows": 0, "processed_at": datetime.now().isoformat(timespec="seconds")}
+    if stmt_key in ledger["statements"]:
+        entry["status"] = "Duplicate statement (same card and end date); not counted"
+        print(f"Duplicate statement period, not counted: {pdf.name} ({card_tab} {entry['period_end']})")
+    else:
+        rows, recon = build_synchrony_rows(parsed)
+        month_of = None
+        ov = STATEMENT_MONTH_OVERRIDES.get(stmt_key)
+        if ov:
+            try:
+                y, mth = (int(x) for x in str(ov).split("-"))
+                month_of = date(y, mth, 1)
+            except ValueError:
+                print(f"STATEMENT_MONTH_OVERRIDES entry for {stmt_key} is not YYYY-MM; ignored.")
+        txns = [make_txn(t, card_tab, parsed["end"], pdf.name, month_of) for t in rows]
+        ledger["transactions"].extend(txns)
+        ledger["statements"][stmt_key] = h
+        recon.update({"card": card_tab, "stmt_end": parsed["end"].isoformat(), "source": pdf.name})
+        ledger["recon"].append(recon)
+        entry["rows"] = len(txns)
+        if recon["status"] != "OK":
+            ledger["review"].append({"source": pdf.name, "line": recon["status"]})
+        note = ""
+        if month_of:
+            note = f" Counted in {month_of:%Y-%m} (STATEMENT_MONTH_OVERRIDES), not the closing month."
+            ledger["review"].append({"source": pdf.name, "line": (
+                f"{card_tab} statement closing {parsed['end']:%m/%d/%Y} is counted in {month_of:%B %Y} as configured "
+                f"(STATEMENT_MONTH_OVERRIDES), so purchases on it dated after that month are included there too.")})
+        entry["status"] = "Processed - " + ("ties to statement" if recon["status"] == "OK" else recon["status"]) + note
+        print(f"Processed: {pdf.name} -> {card_tab}, ends {entry['period_end']}, {len(txns)} rows, "
+              f"{'ties to statement' if recon['status'] == 'OK' else recon['status']}"
+              + (f", counted in {month_of:%Y-%m}" if month_of else ""))
+    ledger["files"][h] = entry
+    return True
+
+
+ITEM_RULES = list(_pc("ITEM_RULES_FIRST", [])) + [
+    # (regex on the item name printed on a store-card statement, category). First match wins; a store-card line that
+    # matches nothing stays 'Online Shopping'. Add your own as ITEM_RULES_FIRST in personal_config.py.
+    (r"GIFT CARD", "Gifts"),
+    (r"ROUTER|WI-?FI|\bUSB|HDMI|CABLE|CHARGER|ADAPTER|\bMOUSE\b|KEYBOARD|MONITOR|LAPTOP|MACBOOK|\bSSD\b|HARD DRIVE|"
+     r"BLUETOOTH|EARBUD|HEADPHONE|SPEAKER|WEBCAM|CAMERA|TABLET|SMART PLUG|BATTER(Y|IES)|ETHERNET|AIRTAG|GL\.?INET|"
+     r"EXTENSION CORD|POWER STRIP|SURGE PROTECT", "Electronics & Software"),
+    (r"VITAMIN|SUPPLEMENT|MAGNESIUM|PROBIOTIC|OMEGA|CHEWABLE|SALINE|FIRST AID|BANDAGE|THERMOMETER|BLOOD PRESSURE|"
+     r"PAIN RELIEF|ANTACID|ALLERGY|MELATONIN|COLLAGEN|BIOTIN|CALCIUM|ZINC|REMEDY|NASAL|\bENSURE\b", "Health & Fitness"),
+    (r"NOZZLE|FLAP DISC|SANDING|SANDPAPER|DRILL|WRENCH|SCREW|\bBOLTS?\b|HARDWARE|\bSAW\b|\bHOSE\b|SPRAYER|CAULK|PLUMB|"
+     r"FAUCET|VALVE|PAINT|ADHESIVE|EPOXY|WELD|GRINDER|\bTOOLS?\b|WORK ?LIGHT|LADDER|CONNECTOR|INSULATION|WEATHERSTRIP|"
+     r"SEALANT", "Home Improvement"),
+    (r"\bRACK\b|ORGANIZER|SHELF|CABINET|FURNITURE|\bCHAIR|\bTABLE\b|\bDESK\b|STORAGE|\bHOOKS?\b|CURTAIN|DRYER BALL|LAUNDRY|"
+     r"TOWEL|BATHTUB|SHOWER|TRASH|VACUUM|\bMOP\b|CLEANER|CLEANING|SPONGE|DISPENSER|KITCHEN|COOKWARE|SERVING|POTPOURRI|"
+     r"CANDLE|\bVASE\b|DECOR|CHRISTMAS|HALLOWEEN|WREATH|ORNAMENT|FLOWERS?|FAUX|FLORAL|PILLOW|BLANKET|\bSHEETS?\b|"
+     r"\bLAMP\b|WATERING|IRRIGATION|GARDEN|\bPLANT|SEED|\bSOIL\b|FILTER|\bMATS?\b|WOOD|WINDOW|PURIFIER|HUMIDIFIER|"
+     r"WASHING MACHINE|DETERGENT|OXICLEAN", "Household"),
+    (r"\bSHIRTS?\b|\bPANTS\b|SOCKS|JACKET|\bCOAT\b|\bSHOES?\b|\bBOOTS?\b|GLOVES?|\bHAT\b|\bDRESS\b|UNDERWEAR|JEANS|"
+     r"SWEATER|SLIPPERS?|HOODIE|\bROBES?\b|PAJAMA", "Clothing"),
+    (r"SHAMPOO|CONDITIONER|\bSOAP\b|LOTION|RAZOR|TOOTHBRUSH|TOOTHPASTE|DEODORANT|SKIN ?CARE|MOISTURIZ|\bHAIR\b|\bNAIL|"
+     r"MAKEUP|COSMETIC|EYE MASK", "Personal Care"),
+    (r"\bTEA\b|COFFEE|SNACK|CANDY|COOKIE|SAUCE|SPICE|\bNUTS?\b|FLOUR|SUGAR|HONEY|JERKY|CEREAL|OLIVE OIL|PROTEIN|"
+     r"CHOCOLATE", "Groceries"),
+    (r"\bBOOKS?\b|NOVEL|PAPERBACK|\bDVD\b|BLU-?RAY", "Recreation & Entertainment"),
+]
+
+
 def link_card_payments(ledger):
     """A payment to a card that has statements loaded is a transfer, but only when the card's own statement shows
     the same payment (same amount, within a few days). Unmatched payments stay expenses so nothing is lost.
@@ -787,11 +1130,19 @@ def link_card_payments(ledger):
         if "link_orig" in t:
             t["flow"], t["cat"] = t.pop("link_orig")
             t["note"] = ""
-    for vendor, card, kind in CARD_LINKS:
-        pays = sorted((datetime.strptime(t["date"], "%Y-%m-%d").date(), t["amount"], t["source"])
-                      for t in ledger["transactions"] if t["card"] == card and t["type"] == PAYMENT)
-        if not pays:
+    for vendor, card, kind, need_loaded in CARD_LINKS:
+        card_pays = [t for t in ledger["transactions"] if t["card"].startswith(card) and t["type"] == PAYMENT]
+        if not card_pays:
             continue
+        if need_loaded:
+            recon = [rc for rc in ledger["recon"] if rc["card"].startswith(card)]
+            for t in card_pays:     # does the statement this payment settles (previous balance) exist in the ledger?
+                cur = next((rc for rc in recon if rc["stmt_end"] == t["stmt_end"]), None)
+                t["settles_loaded"] = bool(cur and cur.get("prev") and cur["prev"] > 0.005 and any(
+                    rc["stmt_end"] < t["stmt_end"] and rc.get("new") is not None and abs(rc["new"] - cur["prev"]) <= 0.005
+                    for rc in recon))
+            card_pays = [t for t in card_pays if t["settles_loaded"]]
+        pays = sorted((datetime.strptime(t["date"], "%Y-%m-%d").date(), t["amount"], t["source"]) for t in card_pays)
         cands = [t for t in ledger["bank_txns"]
                  if t["vendor"] == vendor and t["flow"] == "Expense" and t["cat"] == OTHER_CARDS and t["amount"] < 0]
         used, unmatched = set(), []
@@ -817,7 +1168,12 @@ def link_card_payments(ledger):
                 f"{BANK_NAME} withdrawal (same amount, within a few days). It was made from another account or not yet "
                 f"loaded; the card spend is still counted.")})
         left = [t for i, t in enumerate(cands) if i not in used]
-        if left:
+        if left and need_loaded:
+            ledger["review"].append({"source": left[0]["source"], "line": (
+                f"Card payments: {len(left)} {BANK_NAME} payment(s) to {card} totalling ${-sum(t['amount'] for t in left):,.2f} "
+                f"do not settle a loaded {card} statement (the statement they pay is not loaded), so they stay counted as "
+                f"expenses ('{OTHER_CARDS}'). Load the earlier statements to clear them; nothing is dropped or counted twice.")})
+        elif left:
             ledger["review"].append({"source": left[0]["source"], "line": (
                 f"Card payments: {len(left)} {BANK_NAME} payment(s) to {card} totalling ${-sum(t['amount'] for t in left):,.2f} "
                 f"match no payment on the loaded {card} statements, so they stay counted as expenses "
@@ -1043,20 +1399,26 @@ def med_type(vendor, desc):
     return "Medical Provider"
 
 
-def make_txn(t, card_tab, end, source):
+def make_txn(t, card_tab, end, source, month_of=None):
     vendor, category = classify(t.get("name") or t["desc"], t["type"], t["sec"])
+    if "channel" in t and t["type"] in (PURCHASE, REFUND):      # store-card line: the item name sets the category
+        category = item_category(t["item"], t["channel"], category)
     flag, note = ("", "")
     if t["type"] in (PURCHASE, REFUND):
         flag, note = breach_info(vendor, t["desc"])
     driver = f"{vendor} (vendor)" if category == "Uncategorized" else category
     iso = lambda d: d.isoformat() if d else ""
-    return {
+    mo = month_of or end
+    rec = {
         "subcat": med_type(vendor, t["desc"]) if category == MEDICAL else "",
-        "year": end.year, "month": end.month, "card": card_tab, "type": t["type"], "vendor": vendor,
+        "year": mo.year, "month": mo.month, "card": card_tab, "type": t["type"], "vendor": vendor,
         "category": category, "driver": driver, "amount": t["amount"], "breach": flag, "breach_note": note,
         "date": iso(t["date"]), "post": iso(t["post"]), "stmt_end": end.isoformat(), "source": source,
         "desc": t["desc"], "dcash": t.get("dcash", 0.0),
     }
+    if "channel" in t:
+        rec["channel"], rec["item"] = t["channel"], t["item"]
+    return rec
 
 
 # ----------------------------------------------------------------------------
@@ -1094,12 +1456,17 @@ INCOME_SOURCES = _labels + [INC_BROKER, INC_CHECKS, INC_INT, INC_REFUND, INC_OTH
 # Transfers (money moved, not earned or spent). Internal = between the credit union's own accounts.
 TR_CITI = "Citi card payments (spend counted from the Citi statements)"
 TR_APPLE = "Apple Card payments (spend counted from the Apple Card statements)"
+TR_AMAZON = "Amazon Store Card payments (spend counted from the Amazon Store Card statements)"
 TR_BROKER_OUT = f"Sent back to {BROKER}"
 TR_INTERNAL = f"Between {BANK_NAME} accounts (nets to zero)"
-TRANSFER_KINDS = [TR_CITI, TR_APPLE, TR_BROKER_OUT, TR_INTERNAL]
+TRANSFER_KINDS = [TR_CITI, TR_APPLE, TR_AMAZON, TR_BROKER_OUT, TR_INTERNAL]
 # Card payments made from the bank that become transfers once the card's own statement shows the same payment.
-# (bank vendor text, card tab name, transfer kind). Add Barclays / Chase here when their statements are read.
-CARD_LINKS = [("APPLE CARD", "Apple Card", TR_APPLE)]
+# (bank vendor text, card tab name starts with, transfer kind, only when the statement it pays is loaded).
+# A store card's payment on a statement settles the PREVIOUS statement, so it is a transfer only when that earlier
+# statement (the purchases it pays for) is loaded; otherwise it stays an expense and the spend is not lost.
+# Add Barclays / Chase here when their statements are read.
+CARD_LINKS = [("APPLE CARD", "Apple Card", TR_APPLE, False),
+              ("AMAZON STORE CARD", "Amazon Store Card", TR_AMAZON, True)]
 
 OTHER_CARDS = "Credit card payments - other cards (no statements loaded)"
 PLAN_529 = _pc("PLAN_529_LABEL", "529 plan contributions")
@@ -2142,12 +2509,17 @@ def write_bank_recon(ws, ledger, year, bt_last):
         put(ws, f"F{r0 + 3}", f"=ROUND(F{r0 + 1}-F{r0 + 2},2)", fmt=MONEY)
         put(ws, f"G{r0 + 1}", "The statements also include medical items paid by check or on other accounts, and the "
                               "list may include items paid by card; small differences are normal.", italic=True, size=9)
-    def card_xcheck(r, name, prefix, kind, show_diff):
-        got = round(sum(rc["s_paycred"] for rc in ledger["recon"] if rc.get("s_paycred") is not None
-                        and rc["card"].startswith(prefix) and str(rc["stmt_end"])[:4] == str(year)), 2)
+    def card_xcheck(r, name, prefix, kind, show_diff, settled_only=False):
+        if settled_only:    # store card: only payments that settle a loaded statement are transfers
+            got = round(sum(t["amount"] for t in ledger["transactions"] if t["card"].startswith(prefix)
+                            and t["type"] == PAYMENT and t.get("settles_loaded") and t["date"][:4] == str(year)), 2)
+        else:
+            got = round(sum(rc["s_paycred"] for rc in ledger["recon"] if rc.get("s_paycred") is not None
+                            and rc["card"].startswith(prefix) and str(rc["stmt_end"])[:4] == str(year)), 2)
         if not got and not any(t["cat"] == kind for t in ledger["bank_txns"]):
             return False
-        put(ws, f"A{r}", f"Payments shown on the {name} statements (statement months in year)")
+        put(ws, f"A{r}", f"Payments shown on the {name} statements that settle a loaded statement (dated in year)"
+            if settled_only else f"Payments shown on the {name} statements (statement months in year)")
         put(ws, f"F{r}", got, fmt=MONEY)
         put(ws, f"A{r + 1}", f"Net paid to {name} from {BANK_NAME} in the year (payments less any return)")
         put(ws, f"F{r + 1}", "=-" + _bank_sumifs("L", bt_last, [("F", f'"{kind}"')]).replace("$B$3", str(year)), fmt=MONEY)
@@ -2165,6 +2537,11 @@ def write_bank_recon(ws, ledger, year, bt_last):
         put(ws, f"G{r1}", f"Every Apple Card statement payment is matched to a {BANK_NAME} withdrawal (same amount, within "
                           "a few days), so these should agree; the Review tab lists any that do not.",
             italic=True, size=9)
+        r1 += 3
+    if card_xcheck(r1, "Amazon Store Card", "Amazon Store Card", TR_AMAZON, True, settled_only=True):
+        put(ws, f"G{r1}", f"A payment on a store-card statement settles the previous statement, so it is a transfer only "
+                          f"when that previous statement is loaded. Other payments stay expenses ('{OTHER_CARDS}') until "
+                          "the earlier statements are loaded; the Review tab lists them.", italic=True, size=9)
     for i, w in enumerate((34, 8, 7, 14, 32, 16, 16, 16, 12, 16, 16, 16, 16, 12, 8, 70), start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
@@ -2183,7 +2560,7 @@ def write_cashflow(ws, ledger, year, bt_last, card_bld):
     ws.sheet_view.showGridLines = False
     tx = [t for t in ledger["bank_txns"] if t["year"] == year]
     put(ws, "A1", f"Cash Flow - Income vs Expenses | {ylabel(year)}", bold=True, size=14)
-    put(ws, "A2", f"Income and expenses paid from {BANK_NAME} (all accounts) plus credit card spend (Citi, Apple Card). Transfers "
+    put(ws, "A2", f"Income and expenses paid from {BANK_NAME} (all accounts) plus credit card spend (every card with statements loaded). Transfers "
                   "are shown on the Transfers tab and are not income or expense; payments to cards whose statements are "
                   "loaded are left out of expenses because the card purchases themselves are counted instead.",
         italic=True, size=9)
@@ -2681,7 +3058,7 @@ def write_advisor(wb, ledger, year, bt_last, bld, cf_total_ref=None, live=True):
 
     # ------------------------------------------------------------ Advisor Categories
     put(cs, "A1", f"Spending by Category and Month | {ylabel(year)}", bold=True, size=14)
-    put(cs, "A2", f"Everything paid from {BANK_NAME} plus credit card purchases (Citi, Apple Card), grouped. Payments to cards "
+    put(cs, "A2", f"Everything paid from {BANK_NAME} plus credit card purchases (every card with statements loaded), grouped. Payments to cards "
                   "whose statements are loaded are not spending; the purchases are.", italic=True, size=9)
     hdr = 4
     for i, h in enumerate(["Category", "Group"] + MONTHS + ["Total", "% of spending", "Avg / month"], start=1):
@@ -2804,9 +3181,11 @@ def write_advisor(wb, ledger, year, bt_last, bld, cf_total_ref=None, live=True):
     sw_net = r
     line(r, "Net portfolio withdrawals", lambda i, col: f"={col}{sw_in}+{col}{sw_out}", bold=True)
     r += 1
-    cardpay = [-(a + b) for a, b in zip(d["trn"].get(TR_CITI, [0.0] * 12), d["trn"].get(TR_APPLE, [0.0] * 12))]
-    line(r, "Memo: paid to Citi and Apple Card (purchases counted as spending)",
-         base(lambda m: f"-({bank_f('L', m, 'Transfer', TR_CITI)}+{bank_f('L', m, 'Transfer', TR_APPLE)})",
+    cardpay = [-(a + b + c) for a, b, c in zip(d["trn"].get(TR_CITI, [0.0] * 12), d["trn"].get(TR_APPLE, [0.0] * 12),
+                                               d["trn"].get(TR_AMAZON, [0.0] * 12))]
+    line(r, "Memo: paid to cards whose statements are loaded (purchases counted as spending)",
+         base(lambda m: f"-({bank_f('L', m, 'Transfer', TR_CITI)}+{bank_f('L', m, 'Transfer', TR_APPLE)}"
+                        f"+{bank_f('L', m, 'Transfer', TR_AMAZON)})",
               [round(x, 2) for x in cardpay]))
     r += 1
     line(r, f"Memo: moves between {BANK_NAME} accounts (net zero)",
@@ -2904,6 +3283,82 @@ def build_advisor_file(year, ledger, path):
         return alt
 
 
+def write_store_items(ws, ledger, year, bld):
+    """What was bought on the store cards (Synchrony): one row per purchase or credit, with the item name printed
+    on the statement, a category from the item name, and a tie-out to the card tabs."""
+    ws.sheet_view.showGridLines = False
+    rows = sorted((t for t in ledger["transactions"]
+                   if "channel" in t and t["year"] == year and t["type"] in (PURCHASE, REFUND)),
+                  key=lambda t: (t["date"], t["card"], t["desc"]))
+    put(ws, "A1", f"Store Card Items - what was bought | {ylabel(year)}", bold=True, size=14)
+    put(ws, "A2", "Each purchase and credit on the store card statements with the item name as the statement prints it "
+                  "(Synchrony shows the first 30 characters or so). Category comes from keywords in the item name; add "
+                  "your own rules as ITEM_RULES_FIRST in personal_config.py. The statement month is the month the "
+                  "statement is counted in. Payments are not listed: they are transfers or already counted.",
+        italic=True, size=9)
+    put(ws, "A3", "Year", bold=True)
+    put(ws, "B3", year)
+    heads = ["Date", "Month", "Year", "Card", "Channel", "Item (as printed)", "Category", "Type", "Net spend",
+             "Statement end", "Source file"]
+    hdr = 6
+    for i, h in enumerate(heads, start=1):
+        ws.cell(row=hdr, column=i, value=h)
+    style_header(ws, hdr, 1, len(heads))
+    d = lambda s: datetime.strptime(s, "%Y-%m-%d").date() if s else None
+    for r, t in enumerate(rows, start=hdr + 1):
+        vals = [d(t["date"]), t["month"], t["year"], t["card"], t["channel"], t["item"] or (t["desc"] if not t["channel"] else "(no item shown)"),
+                t["category"], t["type"], round(net(t), 2), d(t["stmt_end"]), t["source"]]
+        for c, v in enumerate(vals, start=1):
+            cell = ws.cell(row=r, column=c, value=v)
+            cell.font = Font(name=FONT, size=10)
+            if c in (1, 10):
+                cell.number_format = "mm/dd/yyyy"
+            elif c == 9:
+                cell.number_format = MONEY
+    last = max(hdr + len(rows), hdr + 1)
+    put(ws, "A4", "Net spend shown (follows the filter)", bold=True)
+    put(ws, "I4", f"=SUBTOTAL(109,I{hdr + 1}:I{last})", bold=True, fmt=MONEY)
+    cats = defaultdict(float)
+    for t in rows:
+        cats[t["category"]] += net(t)
+    order = sorted(cats, key=lambda c: -cats[c])
+    for i, h in enumerate(["Category", "Lines", "Net spend", "% of total"], start=13):
+        ws.cell(row=hdr, column=i, value=h)
+    style_header(ws, hdr, 13, 16)
+    rng = lambda col: f"${col}${hdr + 1}:${col}${last}"
+    r = hdr
+    for cat in order:
+        r += 1
+        put(ws, f"M{r}", cat)
+        put(ws, f"N{r}", f'=COUNTIFS({rng("G")},M{r},{rng("C")},$B$3)')
+        put(ws, f"O{r}", f'=SUMIFS({rng("I")},{rng("G")},M{r},{rng("C")},$B$3)', fmt=MONEY)
+    cat_first, cat_last = hdr + 1, r
+    r += 1
+    put(ws, f"M{r}", "Total", bold=True, fill=SUB_FILL)
+    put(ws, f"N{r}", f"=SUM(N{cat_first}:N{cat_last})", bold=True, fill=SUB_FILL)
+    put(ws, f"O{r}", f"=SUM(O{cat_first}:O{cat_last})", bold=True, fmt=MONEY, fill=SUB_FILL)
+    for rr in range(cat_first, cat_last + 1):
+        put(ws, f"P{rr}", f'=IF($O${r}=0,0,O{rr}/$O${r})', fmt="0.0%")
+    tot_row = r
+    r += 2
+    put(ws, f"M{r}", "Tie-out to the card tabs", bold=True)
+    r += 1
+    for i, h in enumerate(["Card", "This tab", "Card tab", "Difference"], start=13):
+        ws.cell(row=r, column=i, value=h)
+    style_header(ws, r, 13, 16)
+    for card in sorted({t["card"] for t in rows}):
+        r += 1
+        put(ws, f"M{r}", card)
+        put(ws, f"N{r}", f'=SUMIFS({rng("I")},{rng("D")},M{r},{rng("C")},$B$3)', fmt=MONEY)
+        put(ws, f"O{r}", "=" + bld.sumifs("spend", [("year", "$B$3"), ("card", f"$M{r}")]), fmt=MONEY)
+        put(ws, f"P{r}", f"=ROUND(N{r}-O{r},2)", fmt=MONEY)
+    for i, w in enumerate((11, 7, 6, 22, 20, 36, 24, 14, 12, 13, 34, 3, 24, 8, 13, 11), start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = f"A{hdr + 1}"
+    ws.auto_filter.ref = f"A{hdr}:K{last}"
+    return tot_row
+
+
 def build_workbook(year, ledger, path):
     months = ({t["month"] for t in ledger["transactions"] if t["year"] == year}
               | {t["month"] for t in ledger["bank_txns"] if t["year"] == year})
@@ -2934,6 +3389,8 @@ def build_workbook(year, ledger, path):
         for card in cards:
             ws = wb.create_sheet(re.sub(r"[\\/*?:\[\]]", "-", card)[:31])
             write_summary(ws, bld, year, card, [t for t in year_txns if t["card"] == card])
+        if any("channel" in t for t in year_txns):
+            write_store_items(wb.create_sheet("Store Card Items"), ledger, year, bld)
 
     ws = wb.create_sheet("Transactions")
     for i, h in enumerate(TX_COLS, start=1):
@@ -2994,6 +3451,9 @@ def build_workbook(year, ledger, path):
                          "returns'); Previous Balance is the Previous Total Balance. Daily Cash is paid into Apple Cash, "
                          "not credited to the card balance, so it is a memo and is not netted from spend.",
         italic=True, size=9)
+    put(ws, f"A{n + 5}", "Store cards (Synchrony): Purchases = the balance table's 'Purchases, Fees & Others Debits' less fees; "
+                         "Payments+Credits = payments plus other credits; the page-1 summary and the balance table are "
+                         "both read and must agree.", italic=True, size=9)
     for i, w in enumerate((20, 14, 36, 15, 15, 17, 15, 12, 19, 17, 12, 13, 13, 60, 14), start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
@@ -3069,6 +3529,11 @@ def main():
             continue
         if is_apple_pdf(pdf):
             if process_apple_pdf(ledger, pdf, h):
+                new_files += 1
+                new_statements += 1
+            continue
+        if is_synchrony_pdf(pdf):
+            if process_synchrony_pdf(ledger, pdf, h):
                 new_files += 1
                 new_statements += 1
             continue
